@@ -1986,6 +1986,7 @@ fn lock_disk_mounts(
             VolumeMount::Owned {
                 guest,
                 storage: microsandbox_types::OwnedVolumeStorage::Disk { .. },
+                base,
                 ..
             } => {
                 requests.push(DiskLockRequest {
@@ -1996,6 +1997,15 @@ fn lock_disk_mounts(
                     label: format!("owned disk volume {guest:?}"),
                     volume_name: None,
                 });
+                if let Some(base) = base {
+                    // Many sandboxes may read one base; none may hold it for writing.
+                    requests.push(DiskLockRequest {
+                        path: base.clone(),
+                        readonly: true,
+                        label: format!("owned disk base {}", base.display()),
+                        volume_name: None,
+                    });
+                }
             }
             VolumeMount::DiskImage { host, options, .. } => {
                 requests.push(DiskLockRequest {
@@ -2998,6 +3008,8 @@ fn machine_cli_args(
                 options,
                 stat_virtualization,
                 host_permissions,
+                // A base-backed disk boots from its journal's explicit chain.
+                base: _,
             } => {
                 let path = super::owned_volumes::backing_path(
                     &local.sandboxes_dir().join(&config.spec.name),

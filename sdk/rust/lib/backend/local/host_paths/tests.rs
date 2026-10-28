@@ -92,6 +92,7 @@ fn config_with_host_inputs(base: Option<&Path>) -> SandboxConfig {
             options: Default::default(),
             stat_virtualization: StatVirtualization::Strict,
             host_permissions: HostPermissions::Private,
+            base: None,
         },
         VolumeMount::Tmpfs {
             guest: "/scratch".into(),
