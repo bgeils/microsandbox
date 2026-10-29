@@ -3,8 +3,8 @@
 use std::path::Path;
 
 use microsandbox_image::checkpoint::{
-    CompactLayer, DiskGenerationManifest, IntegrityReceipts, sparse_file_integrity,
-    sparse_file_integrity_with_receipts,
+    CompactLayer, DiskGenerationManifest, IntegrityReceipts, ReceiptKind, ReceiptUse,
+    sparse_file_integrity,
 };
 use microsandbox_image::snapshot::{OwnedVolumeCapture, OwnedVolumeData};
 use microsandbox_runtime::checkpoint::{OwnedDiskBase, RuntimeOwnedRootLayer};
@@ -204,6 +204,10 @@ fn stage_owned_disk(
         // No captured layer is ever opened as the child's writable head.
         if index == 0 {
             super::copy_child_disk_layer(&source, &target, None)?;
+            // A link names the same sealed inode; a copy fallback is another inode and is hashed.
+            if let Some(receipts) = receipts {
+                receipts.carry(&source, &target);
+            }
         } else {
             microsandbox_utils::copy::fast_copy(&source, &target)?;
         }
@@ -216,7 +220,8 @@ fn stage_owned_disk(
             // The first layer keeps its captured bytes, so its receipt also serves the journal
             // seeded below. A successor's header is relocated next, so it is hashed directly.
             let actual = if index == 0 {
-                sparse_file_integrity_with_receipts(&target, receipts)?
+                ReceiptUse::trusting(receipts)
+                    .sparse_file_integrity(&target, ReceiptKind::SealedLayer)?
             } else {
                 sparse_file_integrity(&target)?
             };
@@ -585,6 +590,57 @@ mod tests {
                 result.unwrap();
             }
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_first_sealed_layer_is_staged_under_its_installed_receipt() {
+        let home = tempfile::tempdir().unwrap();
+        let source = home.path().join("snapshot");
+        let volume = fixture(&source).await;
+        let installed = source.join("layers/base.raw");
+        let receipts = IntegrityReceipts::new(home.path().join("cache/integrity"));
+        let root = receipts
+            .record_sparse_file_integrity(&installed, ReceiptKind::SealedLayer)
+            .unwrap()
+            .root;
+        let choices = crate::sandbox::restore_resources::RestoreResources {
+            integrity_receipts: Some(receipts.clone()),
+            ..Default::default()
+        };
+        let plant = |root: &str| {
+            let canonical = std::fs::canonicalize(&installed).unwrap();
+            for entry in std::fs::read_dir(receipts.root()).unwrap() {
+                let entry = entry.unwrap().path();
+                let mut receipt: serde_json::Value =
+                    serde_json::from_slice(&std::fs::read(&entry).unwrap()).unwrap();
+                if receipt["identity"]["sealed_layer"]["path"] == canonical.to_str().unwrap() {
+                    receipt["integrity_root"] = root.into();
+                    std::fs::write(&entry, serde_json::to_vec(&receipt).unwrap()).unwrap();
+                }
+            }
+        };
+
+        // The staged link inherits the installed receipt and is checked against it, so a planted
+        // root is refused before publication without reading the layer.
+        plant(&format!("blake3:{}", "0".repeat(64)));
+        let refused = home.path().join("refused");
+        let error =
+            materialize_owned_volumes(std::slice::from_ref(&volume), &source, &refused, &choices)
+                .await
+                .unwrap_err()
+                .to_string();
+        assert!(
+            error.contains("changed during child materialization"),
+            "{error}"
+        );
+        assert!(!refused.join("owned-volumes").exists());
+
+        plant(&root);
+        let child = home.path().join("child");
+        materialize_owned_volumes(&[volume], &source, &child, &choices)
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

@@ -10,8 +10,8 @@ use sha2::{Digest as _, Sha256};
 
 use super::admitted_disk::AdmittedDiskLayers;
 use super::{
-    CheckpointManifest, DiskGenerationManifest, DiskLayerRef, IntegrityReceipts,
-    MemoryExtentContent, MemoryManifest, ObjectId, fs_state_budget_error,
+    CheckpointManifest, DiskGenerationManifest, DiskLayerRef, MemoryExtentContent, MemoryManifest,
+    ObjectId, ReceiptUse, fs_state_budget_error,
 };
 use crate::error::{ImageError, ImageResult};
 
@@ -73,19 +73,25 @@ impl CheckpointClosure {
         expected_root: Option<&ObjectId>,
         fs_state_limit: usize,
     ) -> ImageResult<Self> {
-        Self::open_inner(root.into(), expected_root, true, fs_state_limit, None)
+        Self::open_inner(
+            root.into(),
+            expected_root,
+            true,
+            fs_state_limit,
+            ReceiptUse::Ignore,
+        )
     }
 
-    /// Open a closure for restore, taking a disk layer's root from a host receipt when the layer
-    /// still has the exact identity the receipt recorded.
+    /// Open a closure using host receipts for its sealed disk layers as `receipts` says.
     ///
-    /// Only restore and boot admission may use receipts. Explicit verification, export, and
-    /// capture-time admission keep reading every byte through [`open`](Self::open).
+    /// Restore and boot admission trust a receipt for a layer's exact identity. A publisher that
+    /// just admitted its layers records them. Explicit verification and export read every byte
+    /// through [`open`](Self::open).
     pub fn open_with_receipts(
         root: impl Into<PathBuf>,
         expected_root: Option<&ObjectId>,
         fs_state_limit: usize,
-        receipts: Option<&IntegrityReceipts>,
+        receipts: ReceiptUse<'_>,
     ) -> ImageResult<Self> {
         Self::open_inner(root.into(), expected_root, true, fs_state_limit, receipts)
     }
@@ -99,7 +105,13 @@ impl CheckpointClosure {
         expected_root: Option<&ObjectId>,
         fs_state_limit: usize,
     ) -> ImageResult<Self> {
-        Self::open_inner(root.into(), expected_root, false, fs_state_limit, None)
+        Self::open_inner(
+            root.into(),
+            expected_root,
+            false,
+            fs_state_limit,
+            ReceiptUse::Ignore,
+        )
     }
 
     /// Portable counterpart of [`open_with_receipts`](Self::open_with_receipts) for disk-only
@@ -108,7 +120,7 @@ impl CheckpointClosure {
         root: impl Into<PathBuf>,
         expected_root: Option<&ObjectId>,
         fs_state_limit: usize,
-        receipts: Option<&IntegrityReceipts>,
+        receipts: ReceiptUse<'_>,
     ) -> ImageResult<Self> {
         Self::open_inner(root.into(), expected_root, false, fs_state_limit, receipts)
     }
@@ -118,7 +130,7 @@ impl CheckpointClosure {
         expected_root: Option<&ObjectId>,
         require_host_architecture: bool,
         fs_state_limit: usize,
-        receipts: Option<&IntegrityReceipts>,
+        receipts: ReceiptUse<'_>,
     ) -> ImageResult<Self> {
         let (root_id, checkpoint) = read_checkpoint_root(&root, expected_root)?;
         if require_host_architecture && checkpoint.architecture != std::env::consts::ARCH {
@@ -653,7 +665,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn restore_admission_trusts_receipts_and_explicit_opens_do_not() {
+    fn restore_admission_trusts_receipts_a_publisher_records() {
         use crate::checkpoint::{
             DiskGenerationManifest, DiskLayerRef, IntegrityReceipts, LocalObjectStore,
             sparse_file_integrity,
@@ -695,35 +707,37 @@ mod tests {
         .unwrap();
         let cache = tempfile::tempdir().unwrap();
         let receipts = IntegrityReceipts::new(cache.path().join("integrity"));
-        let open_for_restore = || {
+        let open = |receipts| {
             CheckpointClosure::open_with_receipts(
                 directory.path(),
                 None,
                 DEFAULT_FS_STATE_LIMIT,
-                Some(&receipts),
+                receipts,
             )
         };
 
-        // The first restore hashes the layer and records its receipt.
-        open_for_restore().unwrap();
+        // The publisher hashes its layer and records the receipt.
+        open(ReceiptUse::Record(&receipts)).unwrap();
         let entries = std::fs::read_dir(receipts.root())
             .unwrap()
             .map(|entry| entry.unwrap().path())
             .collect::<Vec<_>>();
         assert_eq!(entries.len(), 1);
 
-        // A receipt naming another root for the unchanged file is believed by restore admission,
-        // which proves no byte was read; explicit opens still hash and accept the layer.
+        // A receipt naming another root for the unchanged layer is believed by restore admission,
+        // which proves no byte was read. Recording and explicit opens still hash and accept it.
         let mut receipt: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&entries[0]).unwrap()).unwrap();
         receipt["integrity_root"] = format!("blake3:{}", "0".repeat(64)).into();
         std::fs::write(&entries[0], serde_json::to_vec(&receipt).unwrap()).unwrap();
         assert!(matches!(
-            open_for_restore(),
+            open(ReceiptUse::Trust(&receipts)),
             Err(ImageError::DigestMismatch { .. })
         ));
         CheckpointClosure::open(directory.path(), None, DEFAULT_FS_STATE_LIMIT).unwrap();
         CheckpointClosure::open_portable(directory.path(), None, DEFAULT_FS_STATE_LIMIT).unwrap();
+        open(ReceiptUse::Record(&receipts)).unwrap();
+        open(ReceiptUse::Trust(&receipts)).unwrap();
     }
 
     #[test]

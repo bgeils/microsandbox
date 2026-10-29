@@ -32,7 +32,7 @@ pub use qcow::{
     create_qcow2_overlay, qcow2_backing_basename, relocate_qcow2_backing, relocated_qcow2_header,
     validate_standalone_qcow2,
 };
-pub use receipts::{IntegrityReceipts, sparse_file_integrity_with_receipts};
+pub use receipts::{IntegrityReceipts, ReceiptKind, ReceiptUse};
 pub use resolver::{CheckpointClosure, CheckpointObjectReadTiming};
 pub use store::{
     AdmittedObject, CaptureObjectBatch, CaptureObjectBatchStats, LocalObjectStore, ObjectId,

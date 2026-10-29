@@ -347,11 +347,32 @@ impl LocalBackend {
             .await?;
         let mut child_stage_guard = None;
         if let Some(stage) = archive_stage {
+            // Canonical before the rename moves the stage away; the closure's receipts follow it.
+            let staged_layers = config.checkpoint_restore.as_ref().and_then(|restore| {
+                std::fs::canonicalize(
+                    restore
+                        .closure
+                        .join(microsandbox_image::snapshot::LAYERS_DIRECTORY),
+                )
+                .ok()
+            });
             relocate_archive_config(&mut config, stage.path(), &sandbox_dir);
             // Keep rename and guard installation in one poll: cancellation must never
             // leave published child storage without an owner.
             std::fs::rename(stage.path(), &sandbox_dir)?;
             child_stage_guard = Some(ChildStageGuard::new(sandbox_dir.clone()));
+            if let (Some(receipts), Some(staged), Some(restore)) = (
+                &config.restore_resources.integrity_receipts,
+                staged_layers,
+                &config.checkpoint_restore,
+            ) {
+                receipts.carry_tree(
+                    &staged,
+                    &restore
+                        .closure
+                        .join(microsandbox_image::snapshot::LAYERS_DIRECTORY),
+                );
+            }
         }
         let _branch_pin = if let Some(source) = config.branch_source.take() {
             tokio::fs::create_dir(&sandbox_dir).await?;

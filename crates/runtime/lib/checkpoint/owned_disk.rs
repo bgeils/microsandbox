@@ -13,8 +13,8 @@ use std::time::Instant;
 
 use microsandbox_image::checkpoint::{
     CompactLayer, DiskCompactionPlan, DiskGenerationManifest, DiskLayerRef, IntegrityReceipts,
-    materialize_compact_prefix, materialize_compact_prefix_over_base, sparse_file_integrity,
-    sparse_file_integrity_with_receipts,
+    ReceiptKind, ReceiptUse, materialize_compact_prefix, materialize_compact_prefix_over_base,
+    sparse_file_integrity,
 };
 use microsandbox_types::DiskCompactionResult;
 use microsandbox_types::snapshot::disk::ExternalDiskBase;
@@ -622,7 +622,8 @@ fn seed_chain(
             // Every layer but the writable head is sealed, so a receipt may stand in for its hash.
             integrity_root: if index + 1 < layers.len() {
                 Some(
-                    sparse_file_integrity_with_receipts(&layer.path, receipts)
+                    ReceiptUse::trusting(receipts)
+                        .sparse_file_integrity(&layer.path, ReceiptKind::SealedLayer)
                         .map_err(|error| error.to_string())?
                         .root,
                 )
@@ -745,7 +746,8 @@ pub fn verify_owned_disk_base(
             canonical.display()
         ));
     }
-    let root = sparse_file_integrity_with_receipts(&canonical, receipts)
+    let root = ReceiptUse::trusting(receipts)
+        .sparse_file_integrity(&canonical, ReceiptKind::ExternalInput)
         .map_err(|error| format!("hash owned disk base {}: {error}", canonical.display()))?
         .root;
     if base_stamp(&canonical)? != before {
@@ -782,7 +784,9 @@ fn check_base(base: &OwnedDiskBase, receipts: Option<&IntegrityReceipts>) -> Res
     // The journal's stamp has no change time, so it cannot see a rewrite that restored the
     // modification time. A receipt recorded with one overrides it when the two disagree.
     if base_stamp(&base.path)? == base.stamp
-        && !receipts.is_some_and(|receipts| receipts.contradicts(&base.path, &base.integrity_root))
+        && !receipts.is_some_and(|receipts| {
+            receipts.contradicts(&base.path, ReceiptKind::ExternalInput, &base.integrity_root)
+        })
     {
         return Ok(());
     }
@@ -1427,7 +1431,13 @@ mod tests {
             let entry = entry.unwrap().path();
             let mut receipt: serde_json::Value =
                 serde_json::from_slice(&std::fs::read(&entry).unwrap()).unwrap();
-            if receipt["identity"]["path"] == canonical.to_str().unwrap() {
+            let identity = receipt["identity"]
+                .as_object()
+                .unwrap()
+                .values()
+                .next()
+                .unwrap();
+            if identity["path"] == canonical.to_str().unwrap() {
                 receipt["integrity_root"] = root.into();
                 std::fs::write(&entry, serde_json::to_vec(&receipt).unwrap()).unwrap();
                 return;
@@ -1558,7 +1568,9 @@ mod tests {
                 &head, 131072, &sealed, "raw",
             ))
             .unwrap();
-        let verified = sparse_file_integrity_with_receipts(&sealed, Some(&receipts)).unwrap();
+        let verified = receipts
+            .sparse_file_integrity(&sealed, ReceiptKind::SealedLayer)
+            .unwrap();
         plant_receipt_root(&receipts, &sealed, PLANTED_ROOT);
 
         seed_runtime_owned_disk_chain(

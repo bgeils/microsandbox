@@ -7,7 +7,7 @@ use std::time::Instant;
 
 use microsandbox_image::checkpoint::{
     CheckpointClosure, CheckpointGeometry, IntegrityReceipts, MemoryExtentContent, ObjectId,
-    ResourceDescriptor, ResourceTreatment,
+    ReceiptUse, ResourceDescriptor, ResourceTreatment,
 };
 use microsandbox_protocol::core::{
     Ready, WORKLOAD_TRANSPORT_BARRIER_VERSION, WorkloadTransportCredit, WorkloadTransportPosition,
@@ -213,9 +213,13 @@ impl PreparedCheckpointRestore {
         let total_started = Instant::now();
         let expected = ObjectId::new(expected_root).map_err(|error| error.to_string())?;
         let closure_started = Instant::now();
-        let closure =
-            CheckpointClosure::open_with_receipts(root, Some(&expected), fs_state_limit, receipts)
-                .map_err(|error| format!("validate checkpoint closure: {error}"))?;
+        let closure = CheckpointClosure::open_with_receipts(
+            root,
+            Some(&expected),
+            fs_state_limit,
+            ReceiptUse::trusting(receipts),
+        )
+        .map_err(|error| format!("validate checkpoint closure: {error}"))?;
         let closure_open_us = closure_started.elapsed().as_micros();
         let pause_generation = closure.checkpoint().pause_generation;
         let agent_started = Instant::now();

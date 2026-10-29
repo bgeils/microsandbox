@@ -6,11 +6,12 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use chrono::Utc;
-use microsandbox_image::checkpoint::{CheckpointClosure, ObjectId};
+use microsandbox_image::checkpoint::{CheckpointClosure, IntegrityReceipts, ObjectId, ReceiptUse};
 use microsandbox_image::snapshot::{
     CheckpointSnapshotState, DESCRIPTOR_FILENAME, DiskLayer, DiskLayerId, FileSnapshotState,
-    ImageRef, LayerFileKind, LayerPayload, Manifest, SCHEMA, SnapshotCapture, SnapshotConsistency,
-    SnapshotFormat, SnapshotId, SnapshotRootDisk, SnapshotScope, SnapshotState, layer_path,
+    ImageRef, LAYERS_DIRECTORY, LayerFileKind, LayerPayload, Manifest, SCHEMA, SnapshotCapture,
+    SnapshotConsistency, SnapshotFormat, SnapshotId, SnapshotRootDisk, SnapshotScope,
+    SnapshotState, layer_path,
 };
 use microsandbox_types::{VolumeMount, canonicalize_volume_mounts};
 use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
@@ -42,6 +43,8 @@ struct CapturedFullSnapshot {
     labels: BTreeMap<String, String>,
     fs_state_limit: usize,
     source_recovery: Option<SnapshotSourceRecoveryError>,
+    /// Receipts recorded for the installed layers, so a restore of this snapshot trusts them.
+    integrity_receipts: Option<IntegrityReceipts>,
 }
 
 /// A complete operation-owned artifact, not yet a durable group member.
@@ -526,13 +529,18 @@ async fn stage_full_snapshot(
         }
         let materialize_us = materialize_started.elapsed().as_micros();
         let closure_verify_started = Instant::now();
-        CheckpointClosure::open(
+        // This admission reads every installed layer; recording it lets a restore trust them.
+        CheckpointClosure::open_with_receipts(
             &checkpoint_destination,
             Some(&captured.checkpoint_root),
             captured.fs_state_limit,
+            ReceiptUse::recording(captured.integrity_receipts.as_ref()),
         )
         .map_err(|error| MicrosandboxError::SnapshotIntegrity(error.to_string()))?;
         let closure_verify_us = closure_verify_started.elapsed().as_micros();
+        // Canonical before promotion renames the staging directory away.
+        let staged_layers =
+            std::fs::canonicalize(checkpoint_destination.join(LAYERS_DIRECTORY)).ok();
         let metadata_started = Instant::now();
         super::metadata::write(&staging_dir, &captured.labels).await?;
         let descriptor = captured
@@ -551,6 +559,12 @@ async fn stage_full_snapshot(
 
         let promote_started = Instant::now();
         promote_snapshot_directory(&staging_dir, dest_dir, force).await?;
+        if let (Some(receipts), Some(staged)) = (&captured.integrity_receipts, staged_layers) {
+            receipts.carry_tree(
+                &staged,
+                &dest_dir.join(CHECKPOINT_DIRECTORY).join(LAYERS_DIRECTORY),
+            );
+        }
         let promote_us = promote_started.elapsed().as_micros();
         tracing::info!(
             target: "microsandbox_checkpoint_timing",
@@ -1013,6 +1027,7 @@ async fn capture_full_snapshot(
             manifest,
             labels: labels.into_iter().collect(),
             fs_state_limit,
+            integrity_receipts: Some(local.integrity_receipts()),
         })
     })();
     validated.map_err(|error| capture_validation_failure(error, outcome.recovery_error.as_deref()))
@@ -2442,6 +2457,7 @@ mod tests {
             manifest,
             labels: BTreeMap::new(),
             fs_state_limit: crate::test_support::DEFAULT_FS_STATE_LIMIT,
+            integrity_receipts: None,
         }
     }
 
