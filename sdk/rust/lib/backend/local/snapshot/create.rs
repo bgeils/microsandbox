@@ -185,6 +185,15 @@ async fn publish_snapshot_group(
         .parent()
         .expect("group staging has a parent")
         .to_path_buf();
+    // Canonical before publication renames the member; its installed layers' receipts follow it.
+    let receipts = local.integrity_receipts();
+    let staged_layers = std::fs::canonicalize(
+        captured
+            .path()
+            .join(CHECKPOINT_DIRECTORY)
+            .join(LAYERS_DIRECTORY),
+    )
+    .ok();
     let published = async {
     lineage.validate_source(local, source_sandbox).await?;
     // Ancestry belongs to the immutable descriptor, not to the group head or export base.
@@ -214,6 +223,9 @@ async fn publish_snapshot_group(
             || format!("msb-{:08x}", rand::random::<u32>()),
         ).await?;
         captured.path = group_dir.join(captured.id().as_str());
+        if let Some(staged) = &staged_layers {
+            receipts.carry_tree(staged, &captured.path().join(CHECKPOINT_DIRECTORY).join(LAYERS_DIRECTORY));
+        }
         super::publication::complete(&publication_db, captured.path(), captured.digest(), captured.manifest()).await?;
         captured.lease = Some(super::lease::reader_async(captured.path.clone()).await?);
         lineage.commit(captured.id()).await?;
