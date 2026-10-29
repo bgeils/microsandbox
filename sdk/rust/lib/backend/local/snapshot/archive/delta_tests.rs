@@ -1052,6 +1052,7 @@ async fn owned_delta_reuses_bytes_and_restores_private_renamed_namespace_after_s
         microsandbox_runtime::checkpoint::load_runtime_owned_disk_chain(
             &child.join("runtime"),
             &microsandbox_types::owned_volume_mount_id("/data"),
+            None,
         )
         .unwrap()
         .unwrap()
@@ -1217,6 +1218,7 @@ async fn owned_file_archives_restore_all_backing_without_source_or_inheritance()
         let disk = microsandbox_runtime::checkpoint::load_runtime_owned_disk_chain(
             &child.join("runtime"),
             &microsandbox_types::owned_volume_mount_id("/data"),
+            None,
         )
         .unwrap()
         .unwrap();

@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use microsandbox_image::checkpoint::{
-    CompactLayer, DiskGenerationManifest, DiskLayerRef, compact_layer_capacity,
+    CompactLayer, DiskGenerationManifest, DiskLayerRef, IntegrityReceipts, compact_layer_capacity,
     sparse_file_integrity, validate_standalone_qcow2,
 };
 use microsandbox_protocol::bootstrap::GuestBootstrap;
@@ -52,6 +52,7 @@ impl RuntimeOwnedAdditionalDisk {
         disks: &[DiskMountSpec],
         bootstrap: &GuestBootstrap,
         runtime_dir: &Path,
+        receipts: Option<&IntegrityReceipts>,
     ) -> Result<BTreeMap<String, Self>, String> {
         let mut providers = BTreeMap::new();
         for disk in disks.iter().filter(|disk| disk.snapshot_owned) {
@@ -91,7 +92,15 @@ impl RuntimeOwnedAdditionalDisk {
             }
             let owned = disk
                 .lifecycle_owned
-                .then(|| RuntimeOwnedDisk::open(runtime_dir, &disk.id, &disk.host, disk.readonly))
+                .then(|| {
+                    RuntimeOwnedDisk::open(
+                        runtime_dir,
+                        &disk.id,
+                        &disk.host,
+                        disk.readonly,
+                        receipts,
+                    )
+                })
                 .transpose()?;
             // disk.raw is a stable launch binding, not necessarily the active file after restore
             // or compaction. Retain a real head handle without reopening a retired raw path.
@@ -415,7 +424,7 @@ mod tests {
         } else {
             parent.join("runtime")
         };
-        RuntimeOwnedAdditionalDisk::open_all(&[disk], bootstrap, &runtime)
+        RuntimeOwnedAdditionalDisk::open_all(&[disk], bootstrap, &runtime, None)
             .unwrap()
             .pop_first()
             .unwrap()
@@ -440,7 +449,8 @@ mod tests {
             RuntimeOwnedAdditionalDisk::open_all(
                 &[disk.clone()],
                 &bootstrap,
-                &dir.path().join("runtime")
+                &dir.path().join("runtime"),
+                None,
             )
             .unwrap()
             .is_empty()
@@ -451,7 +461,8 @@ mod tests {
             RuntimeOwnedAdditionalDisk::open_all(
                 &[disk.clone()],
                 &bootstrap,
-                &dir.path().join("runtime")
+                &dir.path().join("runtime"),
+                None,
             )
             .unwrap()
             .is_empty()
@@ -485,7 +496,8 @@ mod tests {
             RuntimeOwnedAdditionalDisk::open_all(
                 &[disk.clone()],
                 &bootstrap,
-                &dir.path().join("runtime")
+                &dir.path().join("runtime"),
+                None,
             )
             .is_err()
         );
@@ -495,14 +507,20 @@ mod tests {
             RuntimeOwnedAdditionalDisk::open_all(
                 &[disk.clone()],
                 &bootstrap,
-                &dir.path().join("runtime")
+                &dir.path().join("runtime"),
+                None,
             )
             .is_err()
         );
         bootstrap.disk_mounts.clear();
         assert!(
-            RuntimeOwnedAdditionalDisk::open_all(&[disk], &bootstrap, &dir.path().join("runtime"))
-                .is_err()
+            RuntimeOwnedAdditionalDisk::open_all(
+                &[disk],
+                &bootstrap,
+                &dir.path().join("runtime"),
+                None
+            )
+            .is_err()
         );
     }
 

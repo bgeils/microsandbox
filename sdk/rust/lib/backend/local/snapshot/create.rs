@@ -2754,6 +2754,7 @@ mod tests {
         let chain = microsandbox_runtime::checkpoint::load_runtime_owned_disk_chain(
             &sandbox.join("runtime"),
             &microsandbox_types::owned_volume_mount_id("/data"),
+            None,
         )
         .unwrap()
         .unwrap();
@@ -2969,6 +2970,7 @@ mod tests {
                 let chain = microsandbox_runtime::checkpoint::load_runtime_owned_disk_chain(
                     &sandbox.join("runtime"),
                     &microsandbox_types::owned_volume_mount_id("/data"),
+                    None,
                 )
                 .unwrap()
                 .unwrap();

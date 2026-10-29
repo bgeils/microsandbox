@@ -2,7 +2,10 @@
 
 use std::path::Path;
 
-use microsandbox_image::checkpoint::{CompactLayer, DiskGenerationManifest};
+use microsandbox_image::checkpoint::{
+    CompactLayer, DiskGenerationManifest, IntegrityReceipts, sparse_file_integrity,
+    sparse_file_integrity_with_receipts,
+};
 use microsandbox_image::snapshot::{OwnedVolumeCapture, OwnedVolumeData};
 use microsandbox_runtime::checkpoint::{OwnedDiskBase, RuntimeOwnedRootLayer};
 use microsandbox_types::VolumeMount;
@@ -73,6 +76,7 @@ pub(crate) async fn materialize_owned_volumes(
                 let mount_id = volume.mount_id.clone();
                 let readonly = volume.mount.options.readonly;
                 let base = choices.owned_bases.get(&volume.mount.guest).cloned();
+                let receipts = choices.integrity_receipts.clone();
                 let pin = super::super::lease::pin_source(&source)?;
                 let (staging, base) = tokio::task::spawn_blocking(move || {
                     let _lease = pin;
@@ -83,6 +87,7 @@ pub(crate) async fn materialize_owned_volumes(
                         &generation,
                         readonly,
                         base.as_deref(),
+                        receipts.as_ref(),
                     )
                 })
                 .await
@@ -169,11 +174,16 @@ fn stage_owned_disk(
     generation: &DiskGenerationManifest,
     readonly: bool,
     base: Option<&Path>,
+    receipts: Option<&IntegrityReceipts>,
 ) -> MicrosandboxResult<(tempfile::TempDir, Option<OwnedDiskBase>)> {
     let external = match (&generation.external_base, base) {
         (Some(identity), Some(path)) => Some(
-            microsandbox_runtime::checkpoint::verify_owned_disk_base(path, Some(identity))
-                .map_err(MicrosandboxError::SnapshotIntegrity)?,
+            microsandbox_runtime::checkpoint::verify_owned_disk_base(
+                path,
+                Some(identity),
+                receipts,
+            )
+            .map_err(MicrosandboxError::SnapshotIntegrity)?,
         ),
         (None, None) => None,
         _ => return Err(invalid("owned disk base choice differs from its capture")),
@@ -202,10 +212,17 @@ fn stage_owned_disk(
                 "owned disk length changed during child materialization",
             ));
         }
-        if let Some(expected) = &layer.integrity_root
-            && microsandbox_image::checkpoint::sparse_file_integrity(&target)?.root != *expected
-        {
-            return Err(invalid("owned disk changed during child materialization"));
+        if let Some(expected) = &layer.integrity_root {
+            // The first layer keeps its captured bytes, so its receipt also serves the journal
+            // seeded below. A successor's header is relocated next, so it is hashed directly.
+            let actual = if index == 0 {
+                sparse_file_integrity_with_receipts(&target, receipts)?
+            } else {
+                sparse_file_integrity(&target)?
+            };
+            if actual.root != *expected {
+                return Err(invalid("owned disk changed during child materialization"));
+            }
         }
         if let Some(previous) = layers.last() {
             microsandbox_image::checkpoint::relocate_qcow2_backing(&target, &previous.path)?;
@@ -281,6 +298,7 @@ fn stage_owned_disk(
             &layers,
             readonly,
             base.clone(),
+            receipts,
         ),
         None => microsandbox_runtime::checkpoint::seed_runtime_owned_disk_chain(
             &stage.path().join("runtime"),
@@ -288,6 +306,7 @@ fn stage_owned_disk(
             &directory.join("disk.raw"),
             &layers,
             readonly,
+            receipts,
         ),
     }
     .map_err(MicrosandboxError::SnapshotIntegrity)?;
@@ -393,7 +412,7 @@ mod tests {
                         integrity_root: Some(sparse_file_integrity(&head).unwrap().root),
                     }],
                     external_base: Some(
-                        microsandbox_runtime::checkpoint::verify_owned_disk_base(base, None)
+                        microsandbox_runtime::checkpoint::verify_owned_disk_base(base, None, None)
                             .unwrap()
                             .identity(),
                     ),
@@ -448,10 +467,11 @@ mod tests {
         assert!(
             matches!(&mounts[0], VolumeMount::Owned { base: Some(path), .. } if *path == canonical)
         );
-        crate::runtime::owned_volumes::validate(&child, &mounts).unwrap();
+        crate::runtime::owned_volumes::validate(&child, &mounts, None).unwrap();
         let chain = microsandbox_runtime::checkpoint::load_runtime_owned_disk_chain(
             &child.join("runtime"),
             &volume.mount_id,
+            None,
         )
         .unwrap()
         .unwrap();
@@ -498,10 +518,11 @@ mod tests {
         let final_child = home.path().join("child");
         std::fs::rename(&child, &final_child).unwrap();
         std::fs::remove_dir_all(&source).unwrap();
-        crate::runtime::owned_volumes::validate(&final_child, &mounts).unwrap();
+        crate::runtime::owned_volumes::validate(&final_child, &mounts, None).unwrap();
         let chain = microsandbox_runtime::checkpoint::load_runtime_owned_disk_chain(
             &final_child.join("runtime"),
             &volume.mount_id,
+            None,
         )
         .unwrap()
         .unwrap();

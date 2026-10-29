@@ -8,6 +8,7 @@ mod compact;
 mod layer_selection;
 mod manifest;
 mod qcow;
+mod receipts;
 mod resolver;
 mod store;
 
@@ -31,6 +32,7 @@ pub use qcow::{
     create_qcow2_overlay, qcow2_backing_basename, relocate_qcow2_backing, relocated_qcow2_header,
     validate_standalone_qcow2,
 };
+pub use receipts::{IntegrityReceipts, sparse_file_integrity_with_receipts};
 pub use resolver::{CheckpointClosure, CheckpointObjectReadTiming};
 pub use store::{
     AdmittedObject, CaptureObjectBatch, CaptureObjectBatchStats, LocalObjectStore, ObjectId,

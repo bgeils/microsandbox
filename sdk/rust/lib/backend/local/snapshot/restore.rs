@@ -94,9 +94,13 @@ pub(crate) async fn materialize_checkpoint_disk_for_child(
 ) -> MicrosandboxResult<CheckpointDiskMaterialization> {
     let expected = ObjectId::new(&source.checkpoint_root)
         .map_err(|error| MicrosandboxError::SnapshotIntegrity(error.to_string()))?;
-    let source_closure =
-        CheckpointClosure::open_portable(&source.closure, Some(&expected), fs_state_limit)
-            .map_err(|error| MicrosandboxError::SnapshotIntegrity(error.to_string()))?;
+    let source_closure = CheckpointClosure::open_portable_with_receipts(
+        &source.closure,
+        Some(&expected),
+        fs_state_limit,
+        choices.integrity_receipts.as_ref(),
+    )
+    .map_err(|error| MicrosandboxError::SnapshotIntegrity(error.to_string()))?;
     validate_checkpoint_identity(&source_closure, &source.checkpoint_id)?;
     validate_root_disk_closure(&source_closure, root_disk, true)?;
     tokio::fs::create_dir_all(child_stage).await?;
@@ -126,9 +130,13 @@ pub(crate) async fn materialize_checkpoint_child_state(
 ) -> MicrosandboxResult<CheckpointChildMaterialization> {
     let expected = ObjectId::new(checkpoint_root)
         .map_err(|error| MicrosandboxError::SnapshotIntegrity(error.to_string()))?;
-    let child_closure =
-        CheckpointClosure::open(closure_destination, Some(&expected), fs_state_limit)
-            .map_err(|error| MicrosandboxError::SnapshotIntegrity(error.to_string()))?;
+    let child_closure = CheckpointClosure::open_with_receipts(
+        closure_destination,
+        Some(&expected),
+        fs_state_limit,
+        choices.integrity_receipts.as_ref(),
+    )
+    .map_err(|error| MicrosandboxError::SnapshotIntegrity(error.to_string()))?;
     validate_checkpoint_identity(&child_closure, checkpoint_id)?;
     validate_root_disk_closure(&child_closure, root_disk, false)?;
     let upper_layers =
@@ -169,8 +177,13 @@ pub(crate) async fn materialize_checkpoint_child_disk_state(
 ) -> MicrosandboxResult<CheckpointDiskMaterialization> {
     let expected = ObjectId::new(checkpoint_root)
         .map_err(|error| MicrosandboxError::SnapshotIntegrity(error.to_string()))?;
-    let child_closure = CheckpointClosure::open_portable(closure, Some(&expected), fs_state_limit)
-        .map_err(|error| MicrosandboxError::SnapshotIntegrity(error.to_string()))?;
+    let child_closure = CheckpointClosure::open_portable_with_receipts(
+        closure,
+        Some(&expected),
+        fs_state_limit,
+        choices.integrity_receipts.as_ref(),
+    )
+    .map_err(|error| MicrosandboxError::SnapshotIntegrity(error.to_string()))?;
     validate_checkpoint_identity(&child_closure, checkpoint_id)?;
     validate_root_disk_closure(&child_closure, root_disk, true)?;
     let upper_layers =

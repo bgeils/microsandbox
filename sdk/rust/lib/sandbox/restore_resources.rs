@@ -4,7 +4,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::path::PathBuf;
 
 #[cfg(feature = "local")]
-use microsandbox_image::checkpoint::CheckpointGeometry;
+use microsandbox_image::checkpoint::{CheckpointGeometry, IntegrityReceipts};
 use microsandbox_protocol::core::Ready;
 
 #[cfg(feature = "local")]
@@ -32,6 +32,10 @@ pub(crate) struct RestoreResources {
     /// External bases for owned disks captured over one, by guest path. Every such disk needs
     /// one; each is checked against the captured identity before the child is staged.
     pub owned_bases: BTreeMap<String, PathBuf>,
+    /// Host receipts that may stand in for re-hashing an immutable base or sealed layer whose
+    /// exact identity this host already verified. Set by the local backend that stages the child.
+    #[cfg(feature = "local")]
+    pub integrity_receipts: Option<IntegrityReceipts>,
     /// Fill unspecified choices only from validated local source records.
     pub inherit: bool,
     /// Immutable CPU and memory layout read from the checkpoint before config resolution.

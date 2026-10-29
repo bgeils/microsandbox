@@ -55,6 +55,7 @@ use windows_sys::Win32::System::Threading::{
     CREATE_BREAKAWAY_FROM_JOB, CREATE_NEW_PROCESS_GROUP, DETACHED_PROCESS,
 };
 
+use microsandbox_image::checkpoint::IntegrityReceipts;
 use microsandbox_image::{Digest, GlobalCache};
 use microsandbox_metrics::{MetricsRegistry, ReserveSlot, SlotReservation};
 #[cfg(feature = "net")]
@@ -487,8 +488,9 @@ pub async fn spawn_sandbox(
     let file_mounts = resolve_file_mounts(config)?;
     let named_volumes = resolve_named_volumes(local, config).await?;
     let owned_root = local.sandboxes_dir().join(&config.spec.name);
-    super::owned_volumes::validate(&owned_root, &config.spec.mounts)?;
-    let disk_locks = lock_disk_mounts(config, &named_volumes, &owned_root)?;
+    let receipts = local.integrity_receipts();
+    super::owned_volumes::validate(&owned_root, &config.spec.mounts, Some(&receipts))?;
+    let disk_locks = lock_disk_mounts(config, &named_volumes, &owned_root, Some(&receipts))?;
     let metrics_reservation = if config.effective_metrics_interval().is_some() {
         reserve_metrics_slot(local, config, sandbox_id)
     } else {
@@ -1958,6 +1960,7 @@ fn lock_disk_mounts(
     config: &SandboxConfig,
     named_volumes: &HashMap<String, ResolvedNamedVolume>,
     sandbox_dir: &Path,
+    receipts: Option<&IntegrityReceipts>,
 ) -> MicrosandboxResult<Vec<File>> {
     let mut locks = Vec::new();
     let mut requests = Vec::new();
@@ -2009,6 +2012,7 @@ fn lock_disk_mounts(
                     let recorded = microsandbox_runtime::checkpoint::load_runtime_owned_disk_base(
                         &sandbox_dir.join("runtime"),
                         &microsandbox_types::owned_volume_mount_id(guest),
+                        receipts,
                     )
                     .map_err(MicrosandboxError::InvalidConfig)?;
                     // Many disks and sandboxes may read one base; none may hold it for writing.
@@ -6185,8 +6189,8 @@ mod tests {
             ..Default::default()
         };
 
-        let err =
-            super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused")).unwrap_err();
+        let err = super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused"), None)
+            .unwrap_err();
         assert!(err.to_string().contains("more than once per sandbox"));
     }
 
@@ -6218,13 +6222,13 @@ mod tests {
         let base = dir.path().join("base.raw");
         std::fs::write(&base, vec![0_u8; 1024 * 1024]).unwrap();
         let mounts = vec![owned_disk_over("/a", &base), owned_disk_over("/b", &base)];
-        crate::runtime::owned_volumes::prepare(&sandbox, &mounts, false)
+        crate::runtime::owned_volumes::prepare(&sandbox, &mounts, false, None)
             .await
             .unwrap();
         let mut config = config_with_mounts(mounts);
 
         // Two private heads and one shared lock on the base they both read.
-        let locks = super::lock_disk_mounts(&config, &HashMap::new(), &sandbox).unwrap();
+        let locks = super::lock_disk_mounts(&config, &HashMap::new(), &sandbox, None).unwrap();
         assert_eq!(locks.len(), 3);
         drop(locks);
 
@@ -6236,7 +6240,7 @@ mod tests {
             fstype: None,
             options: MountOptions::default(),
         });
-        let err = super::lock_disk_mounts(&config, &HashMap::new(), &sandbox).unwrap_err();
+        let err = super::lock_disk_mounts(&config, &HashMap::new(), &sandbox, None).unwrap_err();
         assert!(err.to_string().contains("more than once per sandbox"));
     }
 
@@ -6254,7 +6258,7 @@ mod tests {
         let link = dir.path().join("current.raw");
         std::os::unix::fs::symlink(&verified, &link).unwrap();
         let mounts = vec![owned_disk_over("/data", &link)];
-        crate::runtime::owned_volumes::prepare(&sandbox, &mounts, false)
+        crate::runtime::owned_volumes::prepare(&sandbox, &mounts, false, None)
             .await
             .unwrap();
         let config = config_with_mounts(mounts);
@@ -6267,14 +6271,14 @@ mod tests {
         // launcher locks, the base the journal verified.
         std::fs::remove_file(&link).unwrap();
         std::os::unix::fs::symlink(&other, &link).unwrap();
-        let locks = super::lock_disk_mounts(&config, &HashMap::new(), &sandbox).unwrap();
+        let locks = super::lock_disk_mounts(&config, &HashMap::new(), &sandbox, None).unwrap();
         assert!(exclusive_lock_refused(&verified));
         assert!(!exclusive_lock_refused(&other));
         drop(locks);
 
         // Removing the configured path does not block a restart either.
         std::fs::remove_file(&link).unwrap();
-        super::lock_disk_mounts(&config, &HashMap::new(), &sandbox).unwrap();
+        super::lock_disk_mounts(&config, &HashMap::new(), &sandbox, None).unwrap();
     }
 
     fn oci_upper_lock_config(name: &str, path: PathBuf) -> SandboxConfig {
@@ -6300,7 +6304,7 @@ mod tests {
         // parallel Unix children to exec and close transient copies of the old locks.
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             loop {
-                match super::lock_disk_mounts(config, &HashMap::new(), Path::new("unused")) {
+                match super::lock_disk_mounts(config, &HashMap::new(), Path::new("unused"), None) {
                     Ok(locks) => return locks,
                     Err(error) => {
                         assert!(
@@ -6328,8 +6332,12 @@ mod tests {
                 let gate = &gate;
                 scope.spawn(move || {
                     gate.wait();
-                    let locks =
-                        super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused"));
+                    let locks = super::lock_disk_mounts(
+                        &config,
+                        &HashMap::new(),
+                        Path::new("unused"),
+                        None,
+                    );
                     // The winner must retain ownership until both contenders have tried.
                     gate.wait();
                     locks
@@ -6375,8 +6383,8 @@ mod tests {
                 ..Default::default()
             },
         });
-        let error =
-            super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused")).unwrap_err();
+        let error = super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused"), None)
+            .unwrap_err();
         assert!(error.to_string().contains("more than once per sandbox"));
         // Failure after acquiring the upper must not leave it reserved for a failed launch.
         config.spec.mounts.clear();
@@ -6389,7 +6397,8 @@ mod tests {
         let disk = dir.path().join("upper.ext4");
         std::fs::write(&disk, b"disk").unwrap();
         let owner = oci_upper_lock_config("owner", disk.clone());
-        let locks = super::lock_disk_mounts(&owner, &HashMap::new(), Path::new("unused")).unwrap();
+        let locks =
+            super::lock_disk_mounts(&owner, &HashMap::new(), Path::new("unused"), None).unwrap();
 
         let mut reader = oci_upper_lock_config("reader", disk.clone());
         reader.spec.image = RootfsSource::Oci(OciRootfsSource {
@@ -6399,7 +6408,7 @@ mod tests {
         // Shared OCI image layers do not require attachment locks. The explicit upper
         // does: even a read-only mount in another VM must conflict with its writer.
         assert!(
-            super::lock_disk_mounts(&reader, &HashMap::new(), Path::new("unused"))
+            super::lock_disk_mounts(&reader, &HashMap::new(), Path::new("unused"), None)
                 .unwrap()
                 .is_empty()
         );
@@ -6413,8 +6422,8 @@ mod tests {
                 ..Default::default()
             },
         });
-        let error =
-            super::lock_disk_mounts(&reader, &HashMap::new(), Path::new("unused")).unwrap_err();
+        let error = super::lock_disk_mounts(&reader, &HashMap::new(), Path::new("unused"), None)
+            .unwrap_err();
         assert!(error.to_string().contains("incompatible disk mode"));
         drop(locks);
         assert_eq!(wait_for_test_oci_disk_mounts(&reader).await.len(), 1);
@@ -6426,10 +6435,11 @@ mod tests {
         let disk = dir.path().join("upper.ext4");
         std::fs::write(&disk, b"disk").unwrap();
         let owner = oci_upper_lock_config("owner", disk);
-        let _locks = super::lock_disk_mounts(&owner, &HashMap::new(), Path::new("unused")).unwrap();
+        let _locks =
+            super::lock_disk_mounts(&owner, &HashMap::new(), Path::new("unused"), None).unwrap();
         let alias = oci_upper_lock_config("alias", dir.path().join(".").join("upper.ext4"));
-        let error =
-            super::lock_disk_mounts(&alias, &HashMap::new(), Path::new("unused")).unwrap_err();
+        let error = super::lock_disk_mounts(&alias, &HashMap::new(), Path::new("unused"), None)
+            .unwrap_err();
         assert!(error.to_string().contains("incompatible disk mode"));
     }
 
@@ -6444,11 +6454,13 @@ mod tests {
         std::os::unix::fs::symlink(&disk, &symlink).unwrap();
         std::fs::hard_link(&disk, &hardlink).unwrap();
         let owner = oci_upper_lock_config("owner", disk);
-        let _locks = super::lock_disk_mounts(&owner, &HashMap::new(), Path::new("unused")).unwrap();
+        let _locks =
+            super::lock_disk_mounts(&owner, &HashMap::new(), Path::new("unused"), None).unwrap();
         for path in [symlink, hardlink] {
             let config = oci_upper_lock_config("alias", path);
             let error =
-                super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused")).unwrap_err();
+                super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused"), None)
+                    .unwrap_err();
             assert!(error.to_string().contains("incompatible disk mode"));
         }
     }
@@ -6460,7 +6472,8 @@ mod tests {
 
         let disk = tempfile::NamedTempFile::new().unwrap();
         let config = oci_upper_lock_config("owner", disk.path().into());
-        let locks = super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused")).unwrap();
+        let locks =
+            super::lock_disk_mounts(&config, &HashMap::new(), Path::new("unused"), None).unwrap();
         assert_eq!(locks.len(), 1);
         let fd = locks[0].as_raw_fd();
         assert_ne!(
@@ -6517,8 +6530,8 @@ mod tests {
         let mut named_volumes = HashMap::new();
         named_volumes.insert("data".to_string(), named_disk(disk));
 
-        let err =
-            super::lock_disk_mounts(&config, &named_volumes, Path::new("unused")).unwrap_err();
+        let err = super::lock_disk_mounts(&config, &named_volumes, Path::new("unused"), None)
+            .unwrap_err();
         assert!(err.to_string().contains("more than once per sandbox"));
     }
 
@@ -6569,10 +6582,10 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         let base = directory.join("disk.raw");
         std::fs::write(&base, b"original base").unwrap();
-        let locks = super::lock_disk_mounts(&config, &HashMap::new(), &sandbox).unwrap();
+        let locks = super::lock_disk_mounts(&config, &HashMap::new(), &sandbox, None).unwrap();
         // Compaction must be able to collect this data file without losing the device lock.
         std::fs::remove_file(&base).unwrap();
-        assert!(super::lock_disk_mounts(&config, &HashMap::new(), &sandbox).is_err());
+        assert!(super::lock_disk_mounts(&config, &HashMap::new(), &sandbox, None).is_err());
         drop(locks);
         // A parallel fork can temporarily retain the marker even though this test dropped
         // its last copy. Verify release of that same marker without racing its next opener.
@@ -6582,7 +6595,7 @@ mod tests {
         )
         .await;
         #[cfg(windows)]
-        assert!(super::lock_disk_mounts(&config, &HashMap::new(), &sandbox).is_ok());
+        assert!(super::lock_disk_mounts(&config, &HashMap::new(), &sandbox, None).is_ok());
     }
 
     #[tokio::test]

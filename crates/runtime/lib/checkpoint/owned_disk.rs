@@ -12,8 +12,9 @@ use std::path::{Component, Path, PathBuf};
 use std::time::Instant;
 
 use microsandbox_image::checkpoint::{
-    CompactLayer, DiskCompactionPlan, DiskGenerationManifest, DiskLayerRef,
+    CompactLayer, DiskCompactionPlan, DiskGenerationManifest, DiskLayerRef, IntegrityReceipts,
     materialize_compact_prefix, materialize_compact_prefix_over_base, sparse_file_integrity,
+    sparse_file_integrity_with_receipts,
 };
 use microsandbox_types::DiskCompactionResult;
 use microsandbox_types::snapshot::disk::ExternalDiskBase;
@@ -112,9 +113,10 @@ impl RuntimeOwnedDisk {
         mount_id: &str,
         launch_base: &Path,
         read_only: bool,
+        receipts: Option<&IntegrityReceipts>,
     ) -> Result<Self, String> {
         if journal_exists(runtime_dir, mount_id)? {
-            let disk = Self::read(runtime_dir, mount_id)?;
+            let disk = Self::read(runtime_dir, mount_id, receipts)?;
             let expected = relative_owned_path(runtime_dir, mount_id, launch_base)?;
             if disk.state.launch_base != expected || disk.state.read_only != read_only {
                 return Err("owned disk journal disagrees with its configured binding".into());
@@ -131,11 +133,17 @@ impl RuntimeOwnedDisk {
                 format: "raw".into(),
             }],
             read_only,
+            None,
         )?;
-        Self::read(runtime_dir, mount_id)
+        Self::read(runtime_dir, mount_id, receipts)
     }
 
-    pub(super) fn read(runtime_dir: &Path, mount_id: &str) -> Result<Self, String> {
+    /// `receipts` lets a base whose stamp moved since the journal recorded it skip its re-hash.
+    pub(super) fn read(
+        runtime_dir: &Path,
+        mount_id: &str,
+        receipts: Option<&IntegrityReceipts>,
+    ) -> Result<Self, String> {
         let state_path = journal_path(runtime_dir, mount_id)?;
         validate_journal_parents(runtime_dir, mount_id)?;
         let metadata = std::fs::symlink_metadata(&state_path).map_err(|error| error.to_string())?;
@@ -150,11 +158,11 @@ impl RuntimeOwnedDisk {
             state_path,
             state,
         };
-        disk.validate(mount_id)?;
+        disk.validate(mount_id, receipts)?;
         Ok(disk)
     }
 
-    fn validate(&self, mount_id: &str) -> Result<(), String> {
+    fn validate(&self, mount_id: &str, receipts: Option<&IntegrityReceipts>) -> Result<(), String> {
         if self.state.schema != SCHEMA
             || self.state.device_id != mount_id
             || !valid_id(&self.state.volume_id, "vol")
@@ -168,7 +176,7 @@ impl RuntimeOwnedDisk {
             if self.state.layers[0].format != "qcow2" {
                 return Err("an owned disk over an external base must start with qcow2".into());
             }
-            check_base(base)?;
+            check_base(base, receipts)?;
         }
         let mut paths = BTreeSet::new();
         let mut ids = BTreeSet::new();
@@ -547,15 +555,25 @@ impl OwnedDiskRetired {
 //--------------------------------------------------------------------------------------------------
 
 /// Seed a new owned disk from child-private files. No existing journal is overwritten.
-/// The last layer is the child's mutable head; captured predecessors are hashed after relocation.
+/// The last layer is the child's mutable head; captured predecessors are hashed after relocation,
+/// unless `receipts` holds one for a sealed predecessor's exact current identity.
 pub fn seed_runtime_owned_disk_chain(
     runtime_dir: &Path,
     mount_id: &str,
     launch_base: &Path,
     layers: &[RuntimeOwnedRootLayer],
     readonly: bool,
+    receipts: Option<&IntegrityReceipts>,
 ) -> Result<(), String> {
-    seed_chain(runtime_dir, mount_id, launch_base, layers, readonly, None)
+    seed_chain(
+        runtime_dir,
+        mount_id,
+        launch_base,
+        layers,
+        readonly,
+        None,
+        receipts,
+    )
 }
 
 /// Seed an owned disk whose first layer reads through a verified external base.
@@ -567,6 +585,7 @@ pub fn seed_runtime_owned_disk_chain_over_base(
     layers: &[RuntimeOwnedRootLayer],
     readonly: bool,
     base: OwnedDiskBase,
+    receipts: Option<&IntegrityReceipts>,
 ) -> Result<(), String> {
     seed_chain(
         runtime_dir,
@@ -575,6 +594,7 @@ pub fn seed_runtime_owned_disk_chain_over_base(
         layers,
         readonly,
         Some(base),
+        receipts,
     )
 }
 
@@ -585,6 +605,7 @@ fn seed_chain(
     layers: &[RuntimeOwnedRootLayer],
     readonly: bool,
     external_base: Option<OwnedDiskBase>,
+    receipts: Option<&IntegrityReceipts>,
 ) -> Result<(), String> {
     let state_path = journal_path(runtime_dir, mount_id)?;
     if journal_exists(runtime_dir, mount_id)? {
@@ -598,9 +619,10 @@ fn seed_chain(
             layer_id: new_id("layer"),
             path,
             format: layer.format.clone(),
+            // Every layer but the writable head is sealed, so a receipt may stand in for its hash.
             integrity_root: if index + 1 < layers.len() {
                 Some(
-                    sparse_file_integrity(&layer.path)
+                    sparse_file_integrity_with_receipts(&layer.path, receipts)
                         .map_err(|error| error.to_string())?
                         .root,
                 )
@@ -623,21 +645,23 @@ fn seed_chain(
             external_base,
         },
     };
-    disk.validate(mount_id)?;
+    disk.validate(mount_id, receipts)?;
     disk.capacity()?;
     write_state(&disk.state_path, &disk.state).map_err(|error| error.to_string())
 }
 
 /// Read an owned disk's complete chain while the caller holds its stopped lifecycle lease.
+/// `receipts` spares re-hashing an external base whose stamp moved since the journal recorded it.
 pub fn load_runtime_owned_disk_chain(
     runtime_dir: &Path,
     mount_id: &str,
+    receipts: Option<&IntegrityReceipts>,
 ) -> Result<Option<RuntimeOwnedRootChain>, String> {
     if !journal_exists(runtime_dir, mount_id)? {
         validate_fresh_storage(runtime_dir, mount_id)?;
         return Ok(None);
     }
-    let disk = RuntimeOwnedDisk::read(runtime_dir, mount_id)?;
+    let disk = RuntimeOwnedDisk::read(runtime_dir, mount_id, receipts)?;
     Ok(Some(RuntimeOwnedRootChain {
         device_id: mount_id.into(),
         virtual_size: disk.capacity()?,
@@ -654,7 +678,7 @@ pub fn capture_stopped_owned_disk(
     readonly: bool,
     checkpoint_root: &Path,
 ) -> Result<DiskGenerationManifest, String> {
-    let mut disk = RuntimeOwnedDisk::open(runtime_dir, mount_id, source, readonly)?;
+    let mut disk = RuntimeOwnedDisk::open(runtime_dir, mount_id, source, readonly, None)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -670,11 +694,12 @@ pub fn capture_stopped_owned_disk(
 pub fn load_runtime_owned_disk_base(
     runtime_dir: &Path,
     mount_id: &str,
+    receipts: Option<&IntegrityReceipts>,
 ) -> Result<Option<OwnedDiskBase>, String> {
     if !journal_exists(runtime_dir, mount_id)? {
         return Ok(None);
     }
-    Ok(RuntimeOwnedDisk::read(runtime_dir, mount_id)?
+    Ok(RuntimeOwnedDisk::read(runtime_dir, mount_id, receipts)?
         .state
         .external_base)
 }
@@ -703,10 +728,13 @@ impl OwnedDiskBase {
 /// Resolve and hash a caller-supplied base, and require it to match `expected` when given.
 ///
 /// The base must be a regular raw file of sector-aligned length. Its identity is read twice,
-/// around the hash, so a file replaced mid-verification is refused rather than recorded.
+/// around the hash, so a file replaced mid-verification is refused rather than recorded. The
+/// base is never written by the runtime, so a host receipt for its exact identity replaces the
+/// hash when `receipts` is given.
 pub fn verify_owned_disk_base(
     path: &Path,
     expected: Option<&ExternalDiskBase>,
+    receipts: Option<&IntegrityReceipts>,
 ) -> Result<OwnedDiskBase, String> {
     let canonical = std::fs::canonicalize(path)
         .map_err(|error| format!("owned disk base {}: {error}", path.display()))?;
@@ -717,7 +745,7 @@ pub fn verify_owned_disk_base(
             canonical.display()
         ));
     }
-    let root = sparse_file_integrity(&canonical)
+    let root = sparse_file_integrity_with_receipts(&canonical, receipts)
         .map_err(|error| format!("hash owned disk base {}: {error}", canonical.display()))?
         .root;
     if base_stamp(&canonical)? != before {
@@ -745,15 +773,20 @@ pub fn verify_owned_disk_base(
 }
 
 /// Refuse a base that is gone or changed. An unchanged stamp is trusted; any other stamp is
-/// hashed again, so a touched but identical file still boots.
-fn check_base(base: &OwnedDiskBase) -> Result<(), String> {
+/// hashed again, so a touched but identical file still boots. The journal keeps its original
+/// stamp, so a receipt is what spares later boots from hashing such a base every time.
+fn check_base(base: &OwnedDiskBase, receipts: Option<&IntegrityReceipts>) -> Result<(), String> {
     if !base.path.is_absolute() || base.bytes == 0 || !base.bytes.is_multiple_of(512) {
         return Err("owned disk journal has an invalid external base".into());
     }
-    if base_stamp(&base.path)? == base.stamp {
+    // The journal's stamp has no change time, so it cannot see a rewrite that restored the
+    // modification time. A receipt recorded with one overrides it when the two disagree.
+    if base_stamp(&base.path)? == base.stamp
+        && !receipts.is_some_and(|receipts| receipts.contradicts(&base.path, &base.integrity_root))
+    {
         return Ok(());
     }
-    let current = verify_owned_disk_base(&base.path, None)?;
+    let current = verify_owned_disk_base(&base.path, None, receipts)?;
     if current.path != base.path
         || current.bytes != base.bytes
         || current.integrity_root != base.integrity_root
@@ -1107,7 +1140,7 @@ mod tests {
         assert_eq!(first.layers.len(), 1);
         assert_eq!(&second.layers[..1], &first.layers);
         assert_eq!(&third.layers[..2], &second.layers);
-        let chain = load_runtime_owned_disk_chain(&runtime, &id)
+        let chain = load_runtime_owned_disk_chain(&runtime, &id, None)
             .unwrap()
             .unwrap();
         assert_eq!(chain.layers.len(), 4);
@@ -1153,13 +1186,14 @@ mod tests {
                 },
             ],
             false,
+            None,
         )
         .unwrap();
         let before = std::fs::read_to_string(journal_path(&runtime, &id).unwrap()).unwrap();
         assert!(!before.contains(&temp.path().display().to_string()));
         let final_root = temp.path().join("published");
         std::fs::rename(runtime.parent().unwrap(), &final_root).unwrap();
-        let chain = load_runtime_owned_disk_chain(&final_root.join("runtime"), &id)
+        let chain = load_runtime_owned_disk_chain(&final_root.join("runtime"), &id, None)
             .unwrap()
             .unwrap();
         assert!(
@@ -1184,10 +1218,10 @@ mod tests {
         let root = runtime.join("root-disk.json");
         std::fs::write(&root, b"existing root journal").unwrap();
         capture_stopped_owned_disk(&runtime, &id, &source, true, &temp.path().join("cp")).unwrap();
-        let disk = RuntimeOwnedDisk::read(&runtime, &id).unwrap();
+        let disk = RuntimeOwnedDisk::read(&runtime, &id, None).unwrap();
         assert!(disk.state.read_only);
         assert_eq!(std::fs::read(root).unwrap(), b"existing root journal");
-        assert!(RuntimeOwnedDisk::open(&runtime, &id, &source, false).is_err());
+        assert!(RuntimeOwnedDisk::open(&runtime, &id, &source, false, None).is_err());
         assert_relative_backing(&disk.layers());
     }
 
@@ -1207,7 +1241,7 @@ mod tests {
                     )
                     .unwrap();
                 }
-                let disk = RuntimeOwnedDisk::open(&runtime, &id, &source, readonly).unwrap();
+                let disk = RuntimeOwnedDisk::open(&runtime, &id, &source, readonly, None).unwrap();
                 let spec = backend_spec(&runtime, &disk.state);
                 assert_eq!(spec.read_only, readonly);
                 assert_eq!(
@@ -1237,7 +1271,7 @@ mod tests {
         for n in 0..3 {
             capture(&runtime, &id, &source, &temp.path().join(format!("cp{n}")));
         }
-        let mut disk = RuntimeOwnedDisk::read(&runtime, &id).unwrap();
+        let mut disk = RuntimeOwnedDisk::read(&runtime, &id, None).unwrap();
         let before_head = std::fs::read(&disk.layers().last().unwrap().path).unwrap();
         let executor = tokio::runtime::Runtime::new().unwrap();
         let dry = disk
@@ -1266,7 +1300,7 @@ mod tests {
         assert_eq!(&std::fs::read(retained).unwrap()[..6], b"before");
         capture(&runtime, &id, &source, &temp.path().join("after"));
         assert_relative_backing(
-            &load_runtime_owned_disk_chain(&runtime, &id)
+            &load_runtime_owned_disk_chain(&runtime, &id, None)
                 .unwrap()
                 .unwrap()
                 .layers,
@@ -1303,7 +1337,8 @@ mod tests {
                 format: "qcow2".into(),
             }],
             false,
-            verify_owned_disk_base(&base, None).unwrap(),
+            verify_owned_disk_base(&base, None, None).unwrap(),
+            None,
         )
         .unwrap();
         (temp, runtime, id, storage.join("disk.raw"), base)
@@ -1314,7 +1349,7 @@ mod tests {
         let (temp, runtime, id, source, base) = based_fixture();
         let canonical = std::fs::canonicalize(&base).unwrap();
         let base_bytes = std::fs::read(&base).unwrap();
-        let chain = load_runtime_owned_disk_chain(&runtime, &id)
+        let chain = load_runtime_owned_disk_chain(&runtime, &id, None)
             .unwrap()
             .unwrap();
         assert_eq!(chain.virtual_size, 131072);
@@ -1340,7 +1375,7 @@ mod tests {
             capture(&runtime, &id, &source, &temp.path().join(format!("cp{n}")));
         }
 
-        let mut disk = RuntimeOwnedDisk::read(&runtime, &id).unwrap();
+        let mut disk = RuntimeOwnedDisk::read(&runtime, &id, None).unwrap();
         assert_eq!(disk.layers().len(), 5);
         let executor = tokio::runtime::Runtime::new().unwrap();
         let prepared = disk
@@ -1370,34 +1405,205 @@ mod tests {
         let replacement = base.with_extension("tmp");
         std::fs::write(&replacement, &bytes).unwrap();
         std::fs::rename(&replacement, &base).unwrap();
-        load_runtime_owned_disk_chain(&runtime, &id)
+        load_runtime_owned_disk_chain(&runtime, &id, None)
             .unwrap()
             .unwrap();
 
         let mut changed = bytes.clone();
         changed[0] = b'B';
         std::fs::write(&base, changed).unwrap();
-        let error = load_runtime_owned_disk_chain(&runtime, &id).unwrap_err();
+        let error = load_runtime_owned_disk_chain(&runtime, &id, None).unwrap_err();
         assert!(error.contains("changed"), "{error}");
 
         std::fs::remove_file(&base).unwrap();
-        assert!(load_runtime_owned_disk_chain(&runtime, &id).is_err());
+        assert!(load_runtime_owned_disk_chain(&runtime, &id, None).is_err());
+    }
+
+    /// Point the receipt recorded for `path` at another root without touching `path` itself.
+    #[cfg(unix)]
+    fn plant_receipt_root(receipts: &IntegrityReceipts, path: &Path, root: &str) {
+        let canonical = std::fs::canonicalize(path).unwrap();
+        for entry in std::fs::read_dir(receipts.root()).unwrap() {
+            let entry = entry.unwrap().path();
+            let mut receipt: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(&entry).unwrap()).unwrap();
+            if receipt["identity"]["path"] == canonical.to_str().unwrap() {
+                receipt["integrity_root"] = root.into();
+                std::fs::write(&entry, serde_json::to_vec(&receipt).unwrap()).unwrap();
+                return;
+            }
+        }
+        panic!("no receipt recorded for {}", path.display());
+    }
+
+    /// Rewrite the first bytes of `path` in place and put its modification time back.
+    #[cfg(unix)]
+    fn rewrite_keeping_modification_time(path: &Path, bytes: &[u8]) {
+        use std::fs::FileTimes;
+        use std::os::unix::fs::MetadataExt;
+
+        let before = std::fs::metadata(path).unwrap();
+        let modified = before.modified().unwrap();
+        let mut writer = OpenOptions::new().write(true).open(path).unwrap();
+        writer.write_all(bytes).unwrap();
+        // Coarse kernel clocks can put the write in the stamp's tick; wait for a new change time.
+        for _ in 0..400 {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            writer
+                .set_times(FileTimes::new().set_modified(modified))
+                .unwrap();
+            let after = std::fs::metadata(path).unwrap();
+            if (after.ctime(), after.ctime_nsec()) != (before.ctime(), before.ctime_nsec()) {
+                assert_eq!(after.modified().unwrap(), modified);
+                assert_eq!((after.ino(), after.len()), (before.ino(), before.len()));
+                return;
+            }
+        }
+        panic!("change time never advanced");
+    }
+
+    #[cfg(unix)]
+    const PLANTED_ROOT: &str =
+        "blake3:0000000000000000000000000000000000000000000000000000000000000000";
+
+    #[cfg(unix)]
+    #[test]
+    fn base_receipts_spare_the_rehash_until_the_base_changes() {
+        let (temp, _runtime, _id, _source, base) = based_fixture();
+        let receipts = IntegrityReceipts::new(temp.path().join("cache/integrity"));
+        let identity = verify_owned_disk_base(&base, None, None)
+            .unwrap()
+            .identity();
+
+        // The first restore hashes and records the base. A receipt naming another root is then
+        // believed, which proves the next restore read none of the base.
+        verify_owned_disk_base(&base, Some(&identity), Some(&receipts)).unwrap();
+        plant_receipt_root(&receipts, &base, PLANTED_ROOT);
+        let error = verify_owned_disk_base(&base, Some(&identity), Some(&receipts)).unwrap_err();
+        assert!(error.contains("differs from the base"), "{error}");
+        plant_receipt_root(&receipts, &base, &identity.integrity_root);
+        verify_owned_disk_base(&base, Some(&identity), Some(&receipts)).unwrap();
+
+        // A new stamp is never served from the old receipt.
+        let replacement = base.with_extension("tmp");
+        std::fs::write(&replacement, std::fs::read(&base).unwrap()).unwrap();
+        std::fs::rename(&replacement, &base).unwrap();
+        plant_receipt_root(&receipts, &base, PLANTED_ROOT);
+        verify_owned_disk_base(&base, Some(&identity), Some(&receipts)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_base_rewritten_with_its_old_modification_time_is_caught_by_change_time() {
+        let (temp, runtime, id, _source, base) = based_fixture();
+        let receipts = IntegrityReceipts::new(temp.path().join("cache/integrity"));
+        let identity = verify_owned_disk_base(&base, None, None)
+            .unwrap()
+            .identity();
+        verify_owned_disk_base(&base, Some(&identity), Some(&receipts)).unwrap();
+
+        // Same inode, length and modification time: only the bytes and the change time differ.
+        rewrite_keeping_modification_time(&base, b"BASE");
+
+        let error = verify_owned_disk_base(&base, Some(&identity), Some(&receipts)).unwrap_err();
+        assert!(error.contains("differs from the base"), "{error}");
+        // The journal's own stamp cannot see this rewrite; the receipt can.
+        load_runtime_owned_disk_chain(&runtime, &id, None)
+            .unwrap()
+            .unwrap();
+        let error = load_runtime_owned_disk_chain(&runtime, &id, Some(&receipts)).unwrap_err();
+        assert!(error.contains("changed since"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_touched_base_is_hashed_once_and_then_served_from_its_receipt() {
+        let (temp, runtime, id, _source, base) = based_fixture();
+        let receipts = IntegrityReceipts::new(temp.path().join("cache/integrity"));
+        let modified = std::fs::metadata(&base).unwrap().modified().unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&base)
+            .unwrap()
+            .set_times(
+                std::fs::FileTimes::new()
+                    .set_modified(modified + std::time::Duration::from_secs(1)),
+            )
+            .unwrap();
+
+        // The journal's stamp no longer matches, so the first boot hashes and records the base.
+        load_runtime_owned_disk_chain(&runtime, &id, Some(&receipts))
+            .unwrap()
+            .unwrap();
+        // Later boots take the root from the receipt: a planted root is believed and refused.
+        plant_receipt_root(&receipts, &base, PLANTED_ROOT);
+        let error = load_runtime_owned_disk_chain(&runtime, &id, Some(&receipts)).unwrap_err();
+        assert!(error.contains("changed since"), "{error}");
+        load_runtime_owned_disk_chain(&runtime, &id, None)
+            .unwrap()
+            .unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seeding_reuses_the_receipt_of_a_verified_sealed_layer() {
+        let (temp, runtime, id, source) = fixture();
+        let receipts = IntegrityReceipts::new(temp.path().join("cache/integrity"));
+        let sealed = source.with_file_name("sealed.raw");
+        std::fs::rename(&source, &sealed).unwrap();
+        let head = source.with_file_name("writable.qcow2");
+        tokio::runtime::Runtime::new()
+            .unwrap()
+            .block_on(microsandbox_image::checkpoint::create_qcow2_overlay(
+                &head, 131072, &sealed, "raw",
+            ))
+            .unwrap();
+        let verified = sparse_file_integrity_with_receipts(&sealed, Some(&receipts)).unwrap();
+        plant_receipt_root(&receipts, &sealed, PLANTED_ROOT);
+
+        seed_runtime_owned_disk_chain(
+            &runtime,
+            &id,
+            &source,
+            &[
+                RuntimeOwnedRootLayer {
+                    path: sealed.clone(),
+                    format: "raw".into(),
+                },
+                RuntimeOwnedRootLayer {
+                    path: head,
+                    format: "qcow2".into(),
+                },
+            ],
+            false,
+            Some(&receipts),
+        )
+        .unwrap();
+        let disk = RuntimeOwnedDisk::read(&runtime, &id, None).unwrap();
+        assert_eq!(
+            disk.state.layers[0].integrity_root.as_deref(),
+            Some(PLANTED_ROOT)
+        );
+        assert_ne!(verified.root, PLANTED_ROOT);
+        // The writable head is never hashed or receipted.
+        assert!(disk.state.layers[1].integrity_root.is_none());
+        assert_eq!(std::fs::read_dir(receipts.root()).unwrap().count(), 1);
     }
 
     #[test]
     fn owned_disk_base_verification_rejects_mismatches_and_bad_shapes() {
         let (temp, _runtime, _id, _source, base) = based_fixture();
-        let verified = verify_owned_disk_base(&base, None).unwrap();
+        let verified = verify_owned_disk_base(&base, None, None).unwrap();
         let identity = verified.identity();
-        verify_owned_disk_base(&base, Some(&identity)).unwrap();
+        verify_owned_disk_base(&base, Some(&identity), None).unwrap();
         let other = temp.path().join("other.raw");
         std::fs::write(&other, vec![1_u8; 131072]).unwrap();
-        assert!(verify_owned_disk_base(&other, Some(&identity)).is_err());
+        assert!(verify_owned_disk_base(&other, Some(&identity), None).is_err());
         let unaligned = temp.path().join("unaligned.raw");
         std::fs::write(&unaligned, vec![0_u8; 1000]).unwrap();
-        assert!(verify_owned_disk_base(&unaligned, None).is_err());
-        assert!(verify_owned_disk_base(temp.path(), None).is_err());
-        assert!(verify_owned_disk_base(&temp.path().join("missing.raw"), None).is_err());
+        assert!(verify_owned_disk_base(&unaligned, None, None).is_err());
+        assert!(verify_owned_disk_base(temp.path(), None, None).is_err());
+        assert!(verify_owned_disk_base(&temp.path().join("missing.raw"), None, None).is_err());
     }
 
     #[test]
@@ -1420,7 +1626,8 @@ mod tests {
                 format: "raw".into(),
             }],
             false,
-            verify_owned_disk_base(&base, None).unwrap(),
+            verify_owned_disk_base(&base, None, None).unwrap(),
+            None,
         )
         .unwrap_err();
         assert!(error.contains("qcow2"), "{error}");
@@ -1430,7 +1637,7 @@ mod tests {
     #[test]
     fn failed_owned_capture_does_not_advance_authoritative_head() {
         let (temp, runtime, id, source) = fixture();
-        RuntimeOwnedDisk::open(&runtime, &id, &source, false).unwrap();
+        RuntimeOwnedDisk::open(&runtime, &id, &source, false, None).unwrap();
         let before = std::fs::read(journal_path(&runtime, &id).unwrap()).unwrap();
         let target = temp.path().join("not-a-directory");
         std::fs::write(&target, b"sentinel").unwrap();
@@ -1456,7 +1663,8 @@ mod tests {
                     path: outside,
                     format: "raw".into()
                 },],
-                false
+                false,
+                None
             )
             .is_err()
         );
@@ -1469,7 +1677,8 @@ mod tests {
                     path: source.clone(),
                     format: "vmdk".into()
                 },],
-                false
+                false,
+                None
             )
             .is_err()
         );
@@ -1489,7 +1698,8 @@ mod tests {
                     path: head.clone(),
                     format: "qcow2".into()
                 },],
-                false
+                false,
+                None
             )
             .unwrap_err()
             .contains("standalone")
@@ -1509,7 +1719,8 @@ mod tests {
                         format: "qcow2".into()
                     },
                 ],
-                false
+                false,
+                None
             )
             .is_err()
         );
@@ -1519,7 +1730,7 @@ mod tests {
     #[test]
     fn owned_journal_uncertain_sync_keeps_durable_forward_record() {
         let (_temp, runtime, id, source) = fixture();
-        let disk = RuntimeOwnedDisk::open(&runtime, &id, &source, false).unwrap();
+        let disk = RuntimeOwnedDisk::open(&runtime, &id, &source, false, None).unwrap();
         let mut next = disk.state.clone();
         next.generation = 7;
         let error = write_state_with_sync(&disk.state_path, &next, |_| {
@@ -1530,7 +1741,7 @@ mod tests {
         #[cfg(feature = "runner")]
         assert!(error.keep_paused);
         assert_eq!(
-            RuntimeOwnedDisk::read(&runtime, &id)
+            RuntimeOwnedDisk::read(&runtime, &id, None)
                 .unwrap()
                 .state
                 .generation,
@@ -1542,18 +1753,18 @@ mod tests {
     fn owned_lost_journal_never_falls_back_to_sealed_raw() {
         let (temp, runtime, id, source) = fixture();
         assert!(
-            load_runtime_owned_disk_chain(&runtime, &id)
+            load_runtime_owned_disk_chain(&runtime, &id, None)
                 .unwrap()
                 .is_none()
         );
         capture(&runtime, &id, &source, &temp.path().join("cp"));
         std::fs::remove_file(journal_path(&runtime, &id).unwrap()).unwrap();
         assert!(
-            load_runtime_owned_disk_chain(&runtime, &id)
+            load_runtime_owned_disk_chain(&runtime, &id, None)
                 .unwrap_err()
                 .contains("journal is missing")
         );
-        assert!(RuntimeOwnedDisk::open(&runtime, &id, &source, false).is_err());
+        assert!(RuntimeOwnedDisk::open(&runtime, &id, &source, false, None).is_err());
         assert!(!journal_path(&runtime, &id).unwrap().exists());
     }
 
@@ -1565,11 +1776,11 @@ mod tests {
         std::fs::create_dir_all(path.parent().unwrap()).unwrap();
         std::os::unix::fs::symlink(temp.path().join("missing"), &path).unwrap();
         assert!(
-            load_runtime_owned_disk_chain(&runtime, &id)
+            load_runtime_owned_disk_chain(&runtime, &id, None)
                 .unwrap_err()
                 .contains("not a regular file")
         );
-        assert!(RuntimeOwnedDisk::open(&runtime, &id, &source, false).is_err());
+        assert!(RuntimeOwnedDisk::open(&runtime, &id, &source, false, None).is_err());
         assert!(
             std::fs::symlink_metadata(path)
                 .unwrap()
@@ -1593,7 +1804,8 @@ mod tests {
                     path: linked,
                     format: "raw".into()
                 },],
-                false
+                false,
+                None
             )
             .is_err()
         );
@@ -1609,7 +1821,8 @@ mod tests {
                     path: source.clone(),
                     format: "raw".into()
                 },],
-                false
+                false,
+                None
             )
             .is_err()
         );

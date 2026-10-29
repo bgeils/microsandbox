@@ -250,6 +250,9 @@ impl LocalBackend {
         let mut pinned_reference: Option<String> = None;
 
         config.apply_runtime_defaults();
+        // Restore staging and owned-volume preparation consult this host's receipts before
+        // re-hashing an immutable base or sealed layer.
+        config.restore_resources.integrity_receipts = Some(self.integrity_receipts());
         validate_hostname(config.spec.runtime.hostname.as_deref())?;
         self.validate_sandbox_name_for_runtime(&config.spec.name)?;
         Self::validate_rootfs_source(&config.spec.image)?;
@@ -809,6 +812,7 @@ impl LocalBackend {
             &sandbox_dir,
             &config.spec.mounts,
             config.snapshot_parent.is_some() || config.checkpoint_restore.is_some(),
+            config.restore_resources.integrity_receipts.as_ref(),
         )
         .await
         {
